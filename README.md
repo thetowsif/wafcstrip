@@ -32,6 +32,43 @@ cat mixed.txt | wafcstrip -v
 cat ips.txt | wafcstrip -cdn cdn.txt -n non-cdn.txt
 ```
 
+## Detection Coverage
+
+The modified version checks providers from two sources:
+
+- `projectdiscovery/cdncheck` bundled provider data
+- live-fetched CIDR ranges at runtime for Cloudflare, CloudFront, and Akamai
+
+### WAF providers detected
+
+- `cloudflare`
+- `akamai`
+- `incapsula`
+- `imperva`
+- `sucuri`
+
+### CDN providers detected
+
+- `cloudfront`
+- `fastly`
+- `google`
+- `leaseweb`
+- `amazon`
+
+### Cloud providers detected by cdncheck
+
+- `aws`
+- `google`
+- `oracle`
+
+### Live range sources used by this version
+
+- Cloudflare IPv4: `https://www.cloudflare.com/ips-v4`
+- Cloudflare IPv6: `https://www.cloudflare.com/ips-v6`
+- CloudFront IPv4 and IPv6: `https://ip-ranges.amazonaws.com/ip-ranges.json`
+- Akamai IPv4: `https://raw.githubusercontent.com/thetowsif/wafcstrip/refs/heads/master/WAF-List/akamai-ipv4.txt`
+- Akamai IPv6: `https://raw.githubusercontent.com/thetowsif/wafcstrip/refs/heads/master/WAF-List/akamai-ipv6.txt`
+
 ## Flags
 
 | Flag | Default | Description |
