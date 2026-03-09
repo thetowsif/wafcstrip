@@ -30,6 +30,41 @@ var cdnClient *cdncheck.Client
 var nonCdnOutputWriter *os.File
 var cdnOutputWriter *os.File
 
+// anew-style deduplication: only write lines not already in the output file.
+var (
+	seenCdn    = make(map[string]struct{})
+	seenNonCdn = make(map[string]struct{})
+	seenMu     sync.Mutex
+)
+
+// loadExisting reads all lines from a file into a set (if the file exists).
+func loadExisting(path string) map[string]struct{} {
+	set := make(map[string]struct{})
+	f, err := os.Open(path)
+	if err != nil {
+		return set
+	}
+	defer f.Close()
+	sc := bufio.NewScanner(f)
+	for sc.Scan() {
+		if line := strings.TrimSpace(sc.Text()); line != "" {
+			set[line] = struct{}{}
+		}
+	}
+	return set
+}
+
+// writeIfNew writes line to w only if it has not been seen before (anew principle).
+func writeIfNew(w *os.File, seen map[string]struct{}, line string) {
+	seenMu.Lock()
+	defer seenMu.Unlock()
+	if _, exists := seen[line]; exists {
+		return
+	}
+	seen[line] = struct{}{}
+	_, _ = w.WriteString(line + "\n")
+}
+
 // liveRange pairs a CIDR network with its vendor name for real-time WAF/CDN checking.
 type liveRange struct {
 	network *net.IPNet
@@ -65,6 +100,7 @@ func main() {
 	fetchLiveRanges()
 
 	if nonCdnOut != "" {
+		seenNonCdn = loadExisting(nonCdnOut)
 		nonCdnOutputWriter, err = os.OpenFile(nonCdnOut, os.O_CREATE|os.O_APPEND|os.O_WRONLY, os.ModePerm)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "failed to create/open noneCdnOutputFile\n")
@@ -75,6 +111,7 @@ func main() {
 	}
 
 	if cdnOut != "" {
+		seenCdn = loadExisting(cdnOut)
 		cdnOutputWriter, err = os.OpenFile(cdnOut, os.O_CREATE|os.O_APPEND|os.O_WRONLY, os.ModePerm)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "failed to create/open notCdnOutputFile\n")
@@ -319,7 +356,7 @@ func cdnChecking(ip string) {
 
 	if matched {
 		if writeOutput {
-			_, _ = cdnOutputWriter.WriteString(ip + "\n")
+			writeIfNew(cdnOutputWriter, seenCdn, ip)
 		}
 		return
 	}
@@ -329,6 +366,6 @@ func cdnChecking(ip string) {
 	}
 
 	if writeOutput {
-		_, _ = nonCdnOutputWriter.WriteString(ip + "\n")
+		writeIfNew(nonCdnOutputWriter, seenNonCdn, ip)
 	}
 }
