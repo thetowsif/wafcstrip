@@ -2,13 +2,17 @@ package main
 
 import (
 	"bufio"
+	"encoding/json"
 	"flag"
 	"fmt"
+	"io"
 	"net"
+	"net/http"
 	"net/url"
 	"os"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/projectdiscovery/cdncheck"
 )
@@ -26,6 +30,26 @@ var cdnClient *cdncheck.Client
 var nonCdnOutputWriter *os.File
 var cdnOutputWriter *os.File
 
+// liveRange pairs a CIDR network with its vendor name for real-time WAF/CDN checking.
+type liveRange struct {
+	network *net.IPNet
+	vendor  string
+}
+
+var liveRanges []liveRange
+
+// awsIPRanges represents the structure of the AWS ip-ranges.json response.
+type awsIPRanges struct {
+	Prefixes []struct {
+		IPPrefix string `json:"ip_prefix"`
+		Service  string `json:"service"`
+	} `json:"prefixes"`
+	IPv6Prefixes []struct {
+		IPv6Prefix string `json:"ipv6_prefix"`
+		Service    string `json:"service"`
+	} `json:"ipv6_prefixes"`
+}
+
 func main() {
 	// cli arguments
 	flag.IntVar(&concurrency, "c", 20, "Set the concurrency level")
@@ -35,10 +59,10 @@ func main() {
 	flag.Parse()
 
 	var err error
-	// if cdnClient, err = cdncheck.NewWithCache(); err != nil {
-	//     log.Fatal(err)
-	// }
 	cdnClient = cdncheck.New()
+
+	// Fetch live WAF/CDN CIDR ranges from Cloudflare, CloudFront, and Akamai
+	fetchLiveRanges()
 
 	if nonCdnOut != "" {
 		nonCdnOutputWriter, err = os.OpenFile(nonCdnOut, os.O_CREATE|os.O_APPEND|os.O_WRONLY, os.ModePerm)
@@ -108,10 +132,140 @@ func incIP(ip net.IP) {
 	}
 }
 
+// fetchLiveRanges fetches real-time CIDR ranges from Cloudflare, CloudFront, and Akamai.
+func fetchLiveRanges() {
+	client := &http.Client{Timeout: 15 * time.Second}
+
+	type fetchResult struct {
+		ranges []liveRange
+		err    error
+		name   string
+	}
+
+	results := make(chan fetchResult, 5)
+
+	// Cloudflare IPv4
+	go func() {
+		ranges, err := fetchTextCIDRs(client, "https://www.cloudflare.com/ips-v4", "cloudflare")
+		results <- fetchResult{ranges, err, "Cloudflare IPv4"}
+	}()
+
+	// Cloudflare IPv6
+	go func() {
+		ranges, err := fetchTextCIDRs(client, "https://www.cloudflare.com/ips-v6", "cloudflare")
+		results <- fetchResult{ranges, err, "Cloudflare IPv6"}
+	}()
+
+	// CloudFront (AWS JSON)
+	go func() {
+		ranges, err := fetchCloudFrontRanges(client)
+		results <- fetchResult{ranges, err, "CloudFront"}
+	}()
+
+	// Akamai IPv4
+	go func() {
+		ranges, err := fetchTextCIDRs(client, "https://raw.githubusercontent.com/thetowsif/wafcstrip/refs/heads/master/WAF-List/akamai-ipv4.txt", "akamai")
+		results <- fetchResult{ranges, err, "Akamai IPv4"}
+	}()
+
+	// Akamai IPv6
+	go func() {
+		ranges, err := fetchTextCIDRs(client, "https://raw.githubusercontent.com/thetowsif/wafcstrip/refs/heads/master/WAF-List/akamai-ipv6.txt", "akamai")
+		results <- fetchResult{ranges, err, "Akamai IPv6"}
+	}()
+
+	var allRanges []liveRange
+	for i := 0; i < 5; i++ {
+		res := <-results
+		if res.err != nil {
+			fmt.Fprintf(os.Stderr, "[warn] failed to fetch %s ranges: %v\n", res.name, res.err)
+			continue
+		}
+		allRanges = append(allRanges, res.ranges...)
+	}
+
+	liveRanges = allRanges
+	if len(liveRanges) > 0 {
+		fmt.Fprintf(os.Stderr, "[info] loaded %d live WAF/CDN CIDR ranges\n", len(liveRanges))
+	}
+}
+
+// fetchTextCIDRs fetches a newline-separated list of CIDRs from a URL.
+func fetchTextCIDRs(client *http.Client, rawURL, vendor string) ([]liveRange, error) {
+	resp, err := client.Get(rawURL)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, err
+	}
+
+	var ranges []liveRange
+	for _, line := range strings.Split(strings.TrimSpace(string(body)), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" {
+			continue
+		}
+		_, network, err := net.ParseCIDR(line)
+		if err != nil {
+			continue
+		}
+		ranges = append(ranges, liveRange{network: network, vendor: vendor})
+	}
+	return ranges, nil
+}
+
+// fetchCloudFrontRanges fetches CloudFront CIDR ranges from the AWS ip-ranges.json endpoint.
+func fetchCloudFrontRanges(client *http.Client) ([]liveRange, error) {
+	resp, err := client.Get("https://ip-ranges.amazonaws.com/ip-ranges.json")
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	var data awsIPRanges
+	if err := json.NewDecoder(resp.Body).Decode(&data); err != nil {
+		return nil, err
+	}
+
+	var ranges []liveRange
+	for _, p := range data.Prefixes {
+		if p.Service == "CLOUDFRONT" {
+			_, network, err := net.ParseCIDR(p.IPPrefix)
+			if err != nil {
+				continue
+			}
+			ranges = append(ranges, liveRange{network: network, vendor: "cloudfront"})
+		}
+	}
+	for _, p := range data.IPv6Prefixes {
+		if p.Service == "CLOUDFRONT" {
+			_, network, err := net.ParseCIDR(p.IPv6Prefix)
+			if err != nil {
+				continue
+			}
+			ranges = append(ranges, liveRange{network: network, vendor: "cloudfront"})
+		}
+	}
+	return ranges, nil
+}
+
+// checkLiveRanges checks if an IP matches any of the live WAF/CDN CIDR ranges.
+func checkLiveRanges(ip net.IP) (bool, string) {
+	for _, lr := range liveRanges {
+		if lr.network.Contains(ip) {
+			return true, lr.vendor
+		}
+	}
+	return false, ""
+}
+
 func cdnChecking(ip string) {
 	// in case input as http format
 	if strings.HasPrefix(ip, "http") {
-		// parse url
 		uu, err := url.Parse(ip)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "failed to parse url: %s\n", err)
@@ -120,27 +274,50 @@ func cdnChecking(ip string) {
 		ip = uu.Hostname()
 	}
 
-	// return matched, value, "cdn", nil
-	_, vendor, ipType, err := cdnClient.Check(net.ParseIP(ip))
+	parsedIP := net.ParseIP(ip)
+	if parsedIP == nil {
+		fmt.Fprintf(os.Stderr, "invalid IP: %s\n", ip)
+		return
+	}
+
+	var vendor, ipType string
+	matched := false
+
+	// First: check via cdncheck library (fast, uses optimized data structures)
+	_, vendor, ipType, err := cdnClient.Check(parsedIP)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "error checking IP: %s\n", err)
 		return
 	}
+
+	if ipType == "cdn" || ipType == "waf" {
+		matched = true
+	}
+
+	// Second: if cdncheck didn't match, check against live-fetched ranges
+	if !matched {
+		if liveMatched, liveVendor := checkLiveRanges(parsedIP); liveMatched {
+			matched = true
+			vendor = liveVendor
+			ipType = "cdn"
+		}
+	}
+
 	if vendor == "" {
 		vendor = "unknown"
 	}
 	if ipType == "" {
 		ipType = "unknown"
 	}
+
 	line := ip
 
-	// print everything if -v flag is set
 	if verbose {
 		line = fmt.Sprintf("%s,%s,%s", vendor, ipType, ip)
 		fmt.Println(line)
 	}
 
-	if ipType == "cdn" || ipType == "waf" {
+	if matched {
 		if writeOutput {
 			_, _ = cdnOutputWriter.WriteString(ip + "\n")
 		}
